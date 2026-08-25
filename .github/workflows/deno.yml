@@ -40,8 +40,7 @@ jobs:
       - name: Format
         run: deno fmt --check
       - name: Test (mock backend)
-        shell: bash
-        run: WEBUSB_BACKEND=mock WEBUSB_LIBRARY=$(pwd)/target/release/$(case "$RUNNER_OS" in Windows) echo webusb.dll;; macOS) echo libwebusb.dylib;; *) echo libwebusb.so;; esac) deno test --allow-ffi --allow-env tests/webusb_test.ts
+        run: deno task test
 
       - name: Release
         uses: softprops/action-gh-release@master
