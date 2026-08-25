@@ -41,7 +41,7 @@ use std::sync::atomic::Ordering;
 
 pub(crate) mod backend;
 pub mod constants;
-#[cfg(any(feature = "native", test))]
+#[cfg(any(all(feature = "native", not(target_os = "windows")), test))]
 mod descriptors;
 #[cfg(feature = "ffi")]
 pub mod ffi;

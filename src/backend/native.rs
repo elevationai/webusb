@@ -23,9 +23,13 @@ use nusb::transfer::TransferError;
 
 use super::BackendDevice;
 use super::TransferOutcome;
+#[cfg(not(target_os = "windows"))]
 use crate::constants::BOS_DESCRIPTOR_TYPE;
+#[cfg(not(target_os = "windows"))]
 use crate::constants::GET_URL_REQUEST;
+#[cfg(not(target_os = "windows"))]
 use crate::descriptors::parse_bos;
+#[cfg(not(target_os = "windows"))]
 use crate::descriptors::parse_webusb_url;
 use crate::next_device_id;
 use crate::DeviceData;
@@ -52,6 +56,7 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(300);
 /// USB hub class code; hubs are not listed, matching browser behavior.
 const HUB_CLASS: u8 = 9;
+#[cfg(not(target_os = "windows"))]
 const GET_DESCRIPTOR_REQUEST: u8 = 0x06;
 const DEFAULT_LANGUAGE_ID: u16 = 0x0409;
 
@@ -191,11 +196,9 @@ impl NativeDevice {
       length,
     };
 
-    // Route interface-recipient requests through the claimed interface
-    // handle; this is required on some platforms (e.g. Windows).
-    let result = match self.claimed_target(setup) {
+    let result = match self.control_target(setup)? {
       Some(interface) => interface.control_in(data, CONTROL_TIMEOUT).await,
-      None => self.device()?.control_in(data, CONTROL_TIMEOUT).await,
+      None => self.device_control_in(data).await?,
     };
 
     match result {
@@ -203,6 +206,24 @@ impl NativeDevice {
       Err(TransferError::Stall) => Ok(TransferOutcome::Stall),
       Err(err) => Err(map_transfer_err(err)),
     }
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  async fn device_control_in(
+    &self,
+    data: ControlIn,
+  ) -> Result<std::result::Result<Vec<u8>, TransferError>> {
+    Ok(self.device()?.control_in(data, CONTROL_TIMEOUT).await)
+  }
+
+  #[cfg(target_os = "windows")]
+  async fn device_control_in(
+    &self,
+    _data: ControlIn,
+  ) -> Result<std::result::Result<Vec<u8>, TransferError>> {
+    // Unreachable: `control_target` always yields an interface or errors
+    // on Windows.
+    Err(Error::NotSupported)
   }
 
   pub(crate) async fn control_transfer_out(
@@ -219,9 +240,9 @@ impl NativeDevice {
       data,
     };
 
-    let result = match self.claimed_target(setup) {
+    let result = match self.control_target(setup)? {
       Some(interface) => interface.control_out(control, CONTROL_TIMEOUT).await,
-      None => self.device()?.control_out(control, CONTROL_TIMEOUT).await,
+      None => self.device_control_out(control).await?,
     };
 
     match result {
@@ -231,16 +252,48 @@ impl NativeDevice {
     }
   }
 
-  /// The claimed interface handle targeted by a control transfer, if any.
-  fn claimed_target(
+  #[cfg(not(target_os = "windows"))]
+  async fn device_control_out(
+    &self,
+    data: ControlOut<'_>,
+  ) -> Result<std::result::Result<(), TransferError>> {
+    Ok(self.device()?.control_out(data, CONTROL_TIMEOUT).await)
+  }
+
+  #[cfg(target_os = "windows")]
+  async fn device_control_out(
+    &self,
+    _data: ControlOut<'_>,
+  ) -> Result<std::result::Result<(), TransferError>> {
+    // Unreachable: `control_target` always yields an interface or errors
+    // on Windows.
+    Err(Error::NotSupported)
+  }
+
+  /// The interface handle a control transfer should go through, or `None`
+  /// for the device-level default control endpoint.
+  ///
+  /// Interface-recipient requests use the claimed interface handle. On
+  /// Windows there are no device-level control transfers (WinUSB requires
+  /// an interface handle), so any claimed interface is used as a fallback;
+  /// with nothing claimed the transfer fails with `NotSupported`.
+  fn control_target(
     &self,
     setup: &UsbControlTransferParameters,
-  ) -> Option<&nusb::Interface> {
-    match setup.recipient {
-      UsbRecipient::Interface => {
-        self.interfaces.get(&((setup.index & 0xFF) as u8))
+  ) -> Result<Option<&nusb::Interface>> {
+    if let UsbRecipient::Interface = setup.recipient {
+      let interface = self.interfaces.get(&((setup.index & 0xFF) as u8));
+      if interface.is_some() {
+        return Ok(interface);
       }
-      _ => None,
+    }
+    if cfg!(target_os = "windows") {
+      match self.interfaces.values().next() {
+        Some(interface) => Ok(Some(interface)),
+        None => Err(Error::NotSupported),
+      }
+    } else {
+      Ok(None)
     }
   }
 
@@ -551,6 +604,17 @@ async fn read_string(
 
 /// Read the WEBUSB_URL from the WebUSB platform capability descriptor.
 /// https://wicg.github.io/webusb/#webusb-platform-capability-descriptor
+///
+/// Not possible on Windows: reading the URL requires a device-level vendor
+/// control request, which WinUSB only allows through a claimed interface.
+#[cfg(target_os = "windows")]
+async fn read_webusb_url(_device: &nusb::Device) -> Option<String> {
+  None
+}
+
+/// Read the WEBUSB_URL from the WebUSB platform capability descriptor.
+/// https://wicg.github.io/webusb/#webusb-platform-capability-descriptor
+#[cfg(not(target_os = "windows"))]
 async fn read_webusb_url(device: &nusb::Device) -> Option<String> {
   // Read the BOS descriptor header to learn its total length.
   let header = device
