@@ -1,7 +1,31 @@
 {
+  "name": "@eai/webusb",
+  "version": "0.6.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./mod.ts",
+    "./mock": "./mock.ts"
+  },
+  "imports": {
+    "@denosaurs/plug": "jsr:@denosaurs/plug@^1.1.0"
+  },
   "tasks": {
     "build": "cargo build --features ffi",
     "test": "cargo build --features ffi && WEBUSB_BACKEND=mock deno test --allow-ffi --allow-env tests/webusb_test.ts"
+  },
+  "publish": {
+    "exclude": [
+      ".github/",
+      "src/",
+      "tests/",
+      "examples/",
+      "Cargo.toml",
+      "Cargo.lock",
+      "bors.toml",
+      "coverage.sh",
+      ".rustfmt.toml",
+      ".gitattributes"
+    ]
   },
   "exclude": [
     "target/"

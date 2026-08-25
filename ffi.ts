@@ -2,6 +2,15 @@
 //
 // Blocking operations are declared `nonblocking` so they run on Deno's FFI
 // thread pool and surface as Promises.
+//
+// The native library is resolved in this order:
+// 1. The `WEBUSB_LIBRARY` environment variable (explicit path).
+// 2. `target/debug` / `target/release` next to this module (git checkouts).
+// 3. Downloaded from the matching GitHub release and cached by
+//    `@denosaurs/plug` (published package).
+
+import { dlopen as plugDlopen } from "@denosaurs/plug";
+import { VERSION } from "./version.ts";
 
 const SYMBOLS = {
   webusb_init: { parameters: ["u8"], result: "i32" },
@@ -122,31 +131,58 @@ function libraryFilename(): string {
   }
 }
 
-function openLibrary(): Deno.DynamicLibrary<typeof SYMBOLS> {
-  const override = envVar("WEBUSB_LIBRARY");
-  const filename = libraryFilename();
-  const candidates = override ? [override] : [
-    new URL(`./target/debug/${filename}`, import.meta.url),
-    new URL(`./target/release/${filename}`, import.meta.url),
-  ];
+const RELEASE_BASE =
+  `https://github.com/elevationai/webusb/releases/download/v${VERSION}`;
 
-  let lastError: unknown;
-  for (const candidate of candidates) {
-    try {
-      return Deno.dlopen(candidate, SYMBOLS);
-    } catch (error) {
-      lastError = error;
+async function openLibrary(): Promise<Deno.DynamicLibrary<typeof SYMBOLS>> {
+  // 1. Explicit override.
+  const override = envVar("WEBUSB_LIBRARY");
+  if (override) {
+    return Deno.dlopen(override, SYMBOLS);
+  }
+
+  // 2. Local cargo build, when running from a checkout.
+  if (import.meta.url.startsWith("file:")) {
+    const filename = libraryFilename();
+    for (const dir of ["debug", "release"]) {
+      try {
+        return Deno.dlopen(
+          new URL(`./target/${dir}/${filename}`, import.meta.url),
+          SYMBOLS,
+        );
+      } catch {
+        // Try the next candidate.
+      }
     }
   }
-  throw new Error(
-    `Could not load the webusb native library (tried ${
-      candidates.join(", ")
-    }). Build it with \`cargo build --features ffi\` or set WEBUSB_LIBRARY. ` +
-      `Last error: ${lastError}`,
-  );
+
+  // 3. Prebuilt library from the GitHub release, cached by plug.
+  try {
+    return await plugDlopen({
+      name: "webusb",
+      url: {
+        darwin: {
+          aarch64: `${RELEASE_BASE}/libwebusb_aarch64.dylib`,
+          x86_64: `${RELEASE_BASE}/libwebusb_x86_64.dylib`,
+        },
+        linux: {
+          aarch64: `${RELEASE_BASE}/libwebusb_aarch64.so`,
+          x86_64: `${RELEASE_BASE}/libwebusb_x86_64.so`,
+        },
+        windows: `${RELEASE_BASE}/webusb_x86_64.dll`,
+      },
+    }, SYMBOLS);
+  } catch (error) {
+    throw new Error(
+      `Could not load the webusb native library for ` +
+        `${Deno.build.os}/${Deno.build.arch} (v${VERSION}). Set ` +
+        `WEBUSB_LIBRARY to a local build (cargo build --features ffi), or ` +
+        `ensure ${RELEASE_BASE} is reachable. Cause: ${error}`,
+    );
+  }
 }
 
-export const lib = openLibrary();
+export const lib: Deno.DynamicLibrary<typeof SYMBOLS> = await openLibrary();
 
 const useMock = envVar("WEBUSB_BACKEND") === "mock";
 export const isMock = useMock;

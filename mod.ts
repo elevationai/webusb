@@ -653,14 +653,10 @@ export class USB extends EventTarget {
   }
 }
 
-const usb = new USB();
+const usb: USB = new USB();
 
-declare global {
-  interface Navigator {
-    usb: USB;
-  }
-}
-
+// `navigator.usb` is installed at runtime; a `declare global` augmentation
+// is not allowed on JSR, so typed access goes through this module's exports.
 Object.defineProperty(navigator, "usb", {
   value: usb,
   configurable: true,

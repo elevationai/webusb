@@ -1,7 +1,7 @@
 // End-to-end tests for the Deno bindings, running against the mock backend.
 // Run with: deno task test
 
-import usb, { USBConnectionEvent, USBDevice } from "../mod.ts";
+import usb, { USB, USBConnectionEvent, USBDevice } from "../mod.ts";
 import {
   addMockDevice,
   mockHaltEndpoint,
@@ -9,6 +9,12 @@ import {
   removeMockDevice,
 } from "../mock.ts";
 import type { MockDeviceConfig } from "../mock.ts";
+
+declare global {
+  interface Navigator {
+    usb: USB;
+  }
+}
 
 const EP_OUT = 4;
 const EP_IN = 5;

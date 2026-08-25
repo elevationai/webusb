@@ -1,7 +1,14 @@
 // Blink an Arduino Leonardo's LED over WebUSB.
 // Run with: cargo build --features ffi && deno run --allow-ffi --allow-env examples/deno_blink.ts
 
+import type { USB } from "../mod.ts";
 import "../mod.ts";
+
+declare global {
+  interface Navigator {
+    usb: USB;
+  }
+}
 
 // Arduino Leonardo.
 const device = await navigator.usb.requestDevice({

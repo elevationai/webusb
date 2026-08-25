@@ -54,17 +54,22 @@ futures_lite::future::block_on(async {
 
 ### Usage with Deno
 
-Importing `mod.ts` installs a spec-shaped `USB` instance as `navigator.usb`
-(including `requestDevice` with filters and `connect`/`disconnect` events).
-Build the native library first:
-
 ```sh
-cargo build --features ffi
-deno run --allow-ffi --allow-env your_script.ts
+deno add jsr:@eai/webusb
 ```
 
+Importing the package installs a spec-shaped `USB` instance as `navigator.usb`
+(including `requestDevice` with filters and `connect`/`disconnect` events).
+
+The native library resolves in this order: the `WEBUSB_LIBRARY` environment
+variable, a local `cargo build --features ffi` when running from a checkout, or
+a prebuilt binary downloaded from the matching GitHub release and cached by
+[plug](https://jsr.io/@denosaurs/plug). The first run therefore needs
+`--allow-net --allow-read --allow-write` in addition to
+`--allow-ffi --allow-env`; cached runs only need `--allow-ffi --allow-env`.
+
 ```typescript
-import "./mod.ts";
+import "@eai/webusb";
 
 // Arduino Leonardo
 const device = await navigator.usb.requestDevice({
@@ -105,7 +110,7 @@ console.log("Bye.");
 Hotplug events:
 
 ```typescript
-import usb from "./mod.ts";
+import usb from "@eai/webusb";
 
 usb.addEventListener("connect", (event) => {
   console.log("connected:", event.device.productName);
@@ -115,8 +120,14 @@ usb.addEventListener("disconnect", (event) => {
 });
 ```
 
-Set `WEBUSB_LIBRARY=/path/to/libwebusb.{so,dylib,dll}` to override where the
-native library is loaded from.
+### Releasing
+
+1. Bump the version in `deno.json`, `version.ts` and `Cargo.toml` (all three
+   must match).
+2. Push a `vX.Y.Z` tag; the release workflow builds the native libraries for
+   macOS (arm64/x64), Linux (arm64/x64) and Windows (x64) and attaches them to
+   the GitHub release.
+3. Run `deno publish` to publish `@eai/webusb` to JSR.
 
 ### Testing
 
