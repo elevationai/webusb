@@ -1,0 +1,9 @@
+{
+  "tasks": {
+    "build": "cargo build --features ffi",
+    "test": "cargo build --features ffi && WEBUSB_BACKEND=mock deno test --allow-ffi --allow-env tests/webusb_test.ts"
+  },
+  "exclude": [
+    "target/"
+  ]
+}

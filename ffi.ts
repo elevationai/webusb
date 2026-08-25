@@ -1,0 +1,211 @@
+// Deno FFI bindings for the `webusb` cdylib (built with `--features ffi`).
+//
+// Blocking operations are declared `nonblocking` so they run on Deno's FFI
+// thread pool and surface as Promises.
+
+const SYMBOLS = {
+  webusb_init: { parameters: ["u8"], result: "i32" },
+  webusb_free_string: { parameters: ["pointer"], result: "void" },
+  webusb_get_devices: {
+    parameters: [],
+    result: "pointer",
+    nonblocking: true,
+  },
+  webusb_request_device: {
+    parameters: ["buffer"],
+    result: "pointer",
+    nonblocking: true,
+  },
+  webusb_open: { parameters: ["u64"], result: "i32", nonblocking: true },
+  webusb_close: { parameters: ["u64"], result: "i32", nonblocking: true },
+  webusb_reset: { parameters: ["u64"], result: "i32", nonblocking: true },
+  webusb_select_configuration: {
+    parameters: ["u64", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_claim_interface: {
+    parameters: ["u64", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_release_interface: {
+    parameters: ["u64", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_select_alternate_interface: {
+    parameters: ["u64", "u8", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_clear_halt: {
+    parameters: ["u64", "u8", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_transfer_in: {
+    parameters: ["u64", "u8", "buffer", "u32", "buffer"],
+    result: "i64",
+    nonblocking: true,
+  },
+  webusb_transfer_out: {
+    parameters: ["u64", "u8", "buffer", "u32", "buffer"],
+    result: "i64",
+    nonblocking: true,
+  },
+  webusb_control_transfer_in: {
+    parameters: [
+      "u64",
+      "u8",
+      "u8",
+      "u8",
+      "u16",
+      "u16",
+      "buffer",
+      "u16",
+      "buffer",
+    ],
+    result: "i64",
+    nonblocking: true,
+  },
+  webusb_control_transfer_out: {
+    parameters: [
+      "u64",
+      "u8",
+      "u8",
+      "u8",
+      "u16",
+      "u16",
+      "buffer",
+      "u32",
+      "buffer",
+    ],
+    result: "i64",
+    nonblocking: true,
+  },
+  webusb_isochronous_transfer_in: {
+    parameters: ["u64", "u8"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_isochronous_transfer_out: {
+    parameters: ["u64", "u8", "buffer", "u32"],
+    result: "i32",
+    nonblocking: true,
+  },
+  webusb_events_start: { parameters: [], result: "i32" },
+  webusb_next_event: { parameters: [], result: "pointer", nonblocking: true },
+  webusb_events_stop: { parameters: [], result: "i32" },
+  webusb_mock_add_device: { parameters: ["buffer"], result: "i64" },
+  webusb_mock_remove_device: { parameters: ["u64"], result: "i32" },
+  webusb_mock_written: { parameters: ["u64"], result: "pointer" },
+  webusb_mock_halt_endpoint: { parameters: ["u64", "u8"], result: "i32" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
+function envVar(name: string): string | undefined {
+  try {
+    return Deno.env.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+function libraryFilename(): string {
+  switch (Deno.build.os) {
+    case "windows":
+      return "webusb.dll";
+    case "darwin":
+      return "libwebusb.dylib";
+    default:
+      return "libwebusb.so";
+  }
+}
+
+function openLibrary(): Deno.DynamicLibrary<typeof SYMBOLS> {
+  const override = envVar("WEBUSB_LIBRARY");
+  const filename = libraryFilename();
+  const candidates = override ? [override] : [
+    new URL(`./target/debug/${filename}`, import.meta.url),
+    new URL(`./target/release/${filename}`, import.meta.url),
+  ];
+
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return Deno.dlopen(candidate, SYMBOLS);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(
+    `Could not load the webusb native library (tried ${
+      candidates.join(", ")
+    }). Build it with \`cargo build --features ffi\` or set WEBUSB_LIBRARY. ` +
+      `Last error: ${lastError}`,
+  );
+}
+
+export const lib = openLibrary();
+
+const useMock = envVar("WEBUSB_BACKEND") === "mock";
+export const isMock = useMock;
+
+const initResult = lib.symbols.webusb_init(useMock ? 1 : 0);
+if (initResult !== 0) {
+  throw new Error(`webusb_init failed with code ${initResult}`);
+}
+
+const encoder = new TextEncoder();
+
+/** Encode a string as a NUL-terminated buffer for FFI input. */
+export function cstr(value: string): Uint8Array {
+  return encoder.encode(value + "\0");
+}
+
+/** Read and free a string returned by the native library. */
+export function takeString(ptr: Deno.PointerValue): string | null {
+  if (ptr === null) return null;
+  const value = new Deno.UnsafePointerView(ptr).getCString();
+  lib.symbols.webusb_free_string(ptr);
+  return value;
+}
+
+/** Read and free a `{"ok": ...} | {"err": code}` JSON response. */
+export function takeJsonResult(ptr: Deno.PointerValue): unknown {
+  const json = takeString(ptr);
+  if (json === null) {
+    throw new Error("webusb: native library returned no data");
+  }
+  const parsed = JSON.parse(json) as { ok?: unknown; err?: number };
+  if (parsed.err !== undefined) {
+    throw errorFromCode(parsed.err);
+  }
+  return parsed.ok;
+}
+
+const ERROR_NAMES: Record<number, string> = {
+  [-1]: "NotFoundError",
+  [-2]: "InvalidStateError",
+  [-3]: "InvalidAccessError",
+  [-4]: "NotSupportedError",
+  [-5]: "NetworkError",
+  [-6]: "NetworkError", // busy
+  [-7]: "SecurityError",
+  [-8]: "NetworkError", // io
+  [-9]: "InvalidStateError", // not initialized
+};
+
+/** Map a native error code to the DOMException the WebUSB spec prescribes. */
+export function errorFromCode(code: number): Error {
+  if (code === -10) {
+    return new TypeError("webusb: invalid argument");
+  }
+  const name = ERROR_NAMES[code];
+  if (name !== undefined) {
+    return new DOMException(`webusb: ${name} (code ${code})`, name);
+  }
+  return new Error(`webusb: unknown native error (code ${code})`);
+}
+
+export const STATUS_NAMES = ["ok", "stall", "babble"] as const;

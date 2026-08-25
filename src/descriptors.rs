@@ -35,7 +35,7 @@ pub(crate) fn parse_bos(bytes: &[u8]) -> Option<(u8, u8)> {
     bytes = &bytes[length..];
 
     assert_return!(i == end);
-    assert_return!(bytes.len() <= 0);
+    assert_return!(bytes.is_empty());
 
     length = bytes[0] as usize;
     // bLength

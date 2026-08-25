@@ -6,10 +6,18 @@
 //! ## Design
 //!
 //! The crate is designed to be as close to the WebUSB specification as possible.
-//! There are two "backends" available, Native and WASM.
+//! There are two backends available:
 //!
-//! The native backend (`libusb`) supports parsing webusb descriptors. The wasm backend will
-//! make use of the runtime's WebUSB implementation.
+//! - `native` (default): real USB devices via [`nusb`].
+//! - `mock`: an in-memory backend for tests and hardware-free development.
+//!
+//! Entry point is [`Usb`] (the equivalent of `navigator.usb`): enumerate with
+//! [`Usb::devices`], select with [`Usb::request_device`], and watch
+//! connect/disconnect events with [`Usb::events`].
+//!
+//! All device operations are `async`. Isochronous transfers are validated but
+//! currently return [`Error::NotSupported`] on the native backend because the
+//! underlying `nusb` library does not support them yet.
 //!
 //! see [usbd-webusb](https://github.com/redpfire/usbd-webusb) for WebUSB compatible firmware
 //! for the device.
@@ -17,150 +25,122 @@
 //! ## Usage
 //!
 //! See [webusb/examples](https://github.com/littledivy/webusb/tree/main/examples) for usage examples.
-//!
 
-#[cfg(feature = "serde_derive")]
+#[cfg(not(any(feature = "native", feature = "mock")))]
+compile_error!(
+  "webusb requires at least one backend feature: `native` or `mock`"
+);
+
+#[cfg(feature = "serde")]
 use serde::Deserialize;
-#[cfg(feature = "deno_ffi")]
-use serde::Deserialize;
-#[cfg(feature = "serde_derive")]
-use serde::Serialize;
-#[cfg(feature = "deno_ffi")]
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
-use std::ops::DerefMut;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-#[cfg(feature = "libusb")]
-use rusb::UsbContext;
-
-use core::convert::TryFrom;
-
-#[cfg(feature = "libusb")]
-pub use rusb;
-
+pub(crate) mod backend;
 pub mod constants;
+#[cfg(any(feature = "native", test))]
 mod descriptors;
-#[cfg(feature = "deno_ffi")]
+#[cfg(feature = "ffi")]
 pub mod ffi;
 
-use crate::constants::BOS_DESCRIPTOR_TYPE;
-use crate::constants::GET_URL_REQUEST;
-use crate::descriptors::parse_bos;
-use crate::descriptors::parse_webusb_url;
+#[cfg(feature = "mock")]
+pub use backend::mock::MockController;
+#[cfg(feature = "mock")]
+pub use backend::mock::MockDeviceConfig;
 
-#[cfg(feature = "deno_ffi")]
-use deno_bindgen::deno_bindgen;
+use backend::BackendDevice;
+use backend::TransferOutcome;
 
-const EP_DIR_IN: u8 = 0x80;
-const EP_DIR_OUT: u8 = 0x0;
+pub(crate) const EP_DIR_IN: u8 = 0x80;
+pub(crate) const EP_DIR_OUT: u8 = 0x0;
 
-#[derive(Debug, PartialEq)]
+/// Monotonic source of device ids, shared by all backends so ids are unique
+/// process-wide and stable for the lifetime of a connected device.
+pub(crate) static NEXT_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_device_id() -> u64 {
+  NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum Error {
-  #[cfg(feature = "libusb")]
-  Usb(rusb::Error),
+  /// Equivalent of DOMException `NotFoundError`.
   NotFound,
+  /// Equivalent of DOMException `InvalidStateError`.
   InvalidState,
+  /// Equivalent of DOMException `InvalidAccessError`.
   InvalidAccess,
+  /// Equivalent of DOMException `NotSupportedError`.
+  NotSupported,
+  /// The device has been disconnected.
+  Disconnected,
+  /// The device or interface is in use by another program or driver.
+  Busy,
+  /// Permission denied by the operating system.
+  Access,
+  /// Any other OS or transport level error.
+  Io(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-#[cfg(feature = "libusb")]
-impl From<rusb::Error> for Error {
-  fn from(err: rusb::Error) -> Self {
-    Self::Usb(err)
-  }
-}
-
-impl<T> From<Option<T>> for Error {
-  fn from(_: Option<T>) -> Self {
-    Self::NotFound
-  }
-}
-
-#[derive(Clone)]
-#[cfg_attr(
-  feature = "serde_derive",
-  derive(Serialize, Deserialize),
-  serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
-pub struct UsbConfiguration {
-  // Index of String Descriptor describing this configuration.
-  configuration_name: Option<String>,
-  // The configuration number (bConfigurationValue)
-  // https://www.beyondlogic.org/usbnutshell/usb5.shtml#ConfigurationDescriptors
-  configuration_value: u8,
-  interfaces: Vec<UsbInterface>,
-}
-
-#[cfg(feature = "libusb")]
-impl UsbConfiguration {
-  pub fn from(
-    config_descriptor: rusb::ConfigDescriptor,
-    handle: &rusb::DeviceHandle<rusb::Context>,
-  ) -> Result<Self> {
-    Ok(UsbConfiguration {
-      configuration_name: match config_descriptor.description_string_index() {
-        None => None,
-        Some(idx) => Some(handle.read_string_descriptor_ascii(idx)?),
-      },
-      configuration_value: config_descriptor.number(),
-      interfaces: config_descriptor
-        .interfaces()
-        .map(|i| UsbInterface::from(i, &handle))
-        .collect::<Vec<UsbInterface>>(),
-    })
-  }
-}
-
-#[derive(Clone)]
-#[cfg_attr(
-  feature = "serde_derive",
-  derive(Serialize, Deserialize),
-  serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
-pub struct UsbInterface {
-  interface_number: u8,
-  alternate: UsbAlternateInterface,
-  alternates: Vec<UsbAlternateInterface>,
-  claimed: bool,
-}
-
-#[cfg(feature = "libusb")]
-impl UsbInterface {
-  pub fn from(
-    i: rusb::Interface,
-    handle: &rusb::DeviceHandle<rusb::Context>,
-  ) -> Self {
-    UsbInterface {
-      interface_number: i.number(),
-      claimed: false,
-      // By default, the alternate setting is for the interface with
-      // bAlternateSetting equal to 0.
-      alternate: {
-        // TODO: don't panic
-        let interface =
-          i.descriptors().find(|d| d.setting_number() == 0).unwrap();
-        UsbAlternateInterface::from(interface, &handle)
-      },
-      alternates: i
-        .descriptors()
-        .map(|interface| UsbAlternateInterface::from(interface, &handle))
-        .collect(),
+impl std::fmt::Display for Error {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Error::NotFound => write!(f, "not found"),
+      Error::InvalidState => write!(f, "invalid state"),
+      Error::InvalidAccess => write!(f, "invalid access"),
+      Error::NotSupported => write!(f, "not supported"),
+      Error::Disconnected => write!(f, "device disconnected"),
+      Error::Busy => write!(f, "device busy"),
+      Error::Access => write!(f, "permission denied"),
+      Error::Io(msg) => write!(f, "{}", msg),
     }
   }
 }
 
-#[derive(Copy, Clone)]
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug)]
 #[cfg_attr(
-  feature = "serde_derive",
+  feature = "serde",
   derive(Serialize, Deserialize),
   serde(rename_all = "camelCase")
 )]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
+pub struct UsbConfiguration {
+  /// Name from the string descriptor describing this configuration.
+  pub configuration_name: Option<String>,
+  /// The configuration number (bConfigurationValue)
+  /// https://www.beyondlogic.org/usbnutshell/usb5.shtml#ConfigurationDescriptors
+  pub configuration_value: u8,
+  pub interfaces: Vec<UsbInterface>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbInterface {
+  pub interface_number: u8,
+  /// The currently selected alternate setting.
+  pub alternate: UsbAlternateInterface,
+  pub alternates: Vec<UsbAlternateInterface>,
+  #[cfg_attr(feature = "serde", serde(default))]
+  pub claimed: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "lowercase")
+)]
 pub enum UsbEndpointType {
   Bulk,
   Interrupt,
@@ -168,40 +148,36 @@ pub enum UsbEndpointType {
   Control,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-  feature = "serde_derive",
+  feature = "serde",
   derive(Serialize, Deserialize),
   serde(rename_all = "lowercase")
 )]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "lowercase"))]
 pub enum Direction {
   In,
   Out,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[cfg_attr(
-  feature = "serde_derive",
+  feature = "serde",
   derive(Serialize, Deserialize),
   serde(rename_all = "camelCase")
 )]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
 pub struct UsbEndpoint {
-  endpoint_number: u8,
-  direction: Direction,
-  // TODO(@littledivy): Get rid of reserved `type` key somehow?
-  r#type: UsbEndpointType,
-  packet_size: u16,
+  pub endpoint_number: u8,
+  pub direction: Direction,
+  pub r#type: UsbEndpointType,
+  pub packet_size: u16,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[cfg_attr(
-  feature = "serde_derive",
+  feature = "serde",
   derive(Serialize, Deserialize),
   serde(rename_all = "camelCase")
 )]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
 pub struct UsbAlternateInterface {
   pub alternate_setting: u8,
   pub interface_class: u8,
@@ -211,73 +187,242 @@ pub struct UsbAlternateInterface {
   pub endpoints: Vec<UsbEndpoint>,
 }
 
-#[cfg(feature = "libusb")]
-impl UsbAlternateInterface {
-  pub fn from(
-    d: rusb::InterfaceDescriptor,
-    handle: &rusb::DeviceHandle<rusb::Context>,
-  ) -> Self {
-    UsbAlternateInterface {
-      alternate_setting: d.setting_number(),
-      interface_class: d.class_code(),
-      interface_subclass: d.sub_class_code(),
-      interface_protocol: d.protocol_code(),
-      interface_name: d
-        .description_string_index()
-        .map(|idx| handle.read_string_descriptor_ascii(idx).unwrap()),
-      endpoints: d
-        .endpoint_descriptors()
-        .map(|e| UsbEndpoint {
-          endpoint_number: e.number(),
-          packet_size: e.max_packet_size(),
-          direction: match e.direction() {
-            rusb::Direction::In => Direction::In,
-            rusb::Direction::Out => Direction::Out,
-          },
-          r#type: match e.transfer_type() {
-            rusb::TransferType::Control => UsbEndpointType::Control,
-            rusb::TransferType::Isochronous => UsbEndpointType::Isochronous,
-            rusb::TransferType::Bulk => UsbEndpointType::Bulk,
-            rusb::TransferType::Interrupt => UsbEndpointType::Interrupt,
-          },
-        })
-        .collect(),
-    }
-  }
-}
-
-#[cfg(feature = "deno_ffi")]
-macro_rules! get_device_handle {
-  ($self: expr) => {
-    ffi::RESOURCES
-      .lock()
-      .unwrap()
-      .get_mut(&$self.rid)
-      .unwrap()
-      .lock()
-      .unwrap()
-      .device_handle
-      .as_mut()
-  };
-}
-
-#[cfg(not(feature = "deno_ffi"))]
-macro_rules! get_device_handle {
-  ($self: expr) => {
-    $self.device_handle.as_mut()
-  };
-}
-
-/// Represents a UsbDevice.
-/// Only way you can obtain one is through `Context::devices`
-/// https://wicg.github.io/webusb/#device-usage
+/// Status of a completed (or failed) transfer.
+/// https://wicg.github.io/webusb/#enumdef-usbtransferstatus
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-  feature = "serde_derive",
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "lowercase")
+)]
+pub enum UsbTransferStatus {
+  Ok,
+  Stall,
+  Babble,
+}
+
+/// https://wicg.github.io/webusb/#usbintransferresult
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
   derive(Serialize, Deserialize),
   serde(rename_all = "camelCase")
 )]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
+pub struct UsbInTransferResult {
+  pub data: Vec<u8>,
+  pub status: UsbTransferStatus,
+}
+
+/// https://wicg.github.io/webusb/#usbouttransferresult
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbOutTransferResult {
+  pub bytes_written: usize,
+  pub status: UsbTransferStatus,
+}
+
+/// https://wicg.github.io/webusb/#usbisochronousintransferpacket
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbIsochronousInTransferPacket {
+  pub data: Vec<u8>,
+  pub status: UsbTransferStatus,
+}
+
+/// https://wicg.github.io/webusb/#usbisochronousintransferresult
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbIsochronousInTransferResult {
+  pub packets: Vec<UsbIsochronousInTransferPacket>,
+}
+
+/// https://wicg.github.io/webusb/#usbisochronousouttransferpacket
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbIsochronousOutTransferPacket {
+  pub bytes_written: usize,
+  pub status: UsbTransferStatus,
+}
+
+/// https://wicg.github.io/webusb/#usbisochronousouttransferresult
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbIsochronousOutTransferResult {
+  pub packets: Vec<UsbIsochronousOutTransferPacket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "lowercase")
+)]
+pub enum UsbRequestType {
+  Standard,
+  Class,
+  Vendor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "lowercase")
+)]
+pub enum UsbRecipient {
+  Device,
+  Interface,
+  Endpoint,
+  Other,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase")
+)]
+pub struct UsbControlTransferParameters {
+  pub request_type: UsbRequestType,
+  pub recipient: UsbRecipient,
+  pub request: u8,
+  pub value: u16,
+  pub index: u16,
+}
+
+/// https://wicg.github.io/webusb/#dictdef-usbdevicefilter
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize, Deserialize),
+  serde(rename_all = "camelCase", default)
+)]
+pub struct UsbDeviceFilter {
+  pub vendor_id: Option<u16>,
+  pub product_id: Option<u16>,
+  pub class_code: Option<u8>,
+  pub subclass_code: Option<u8>,
+  pub protocol_code: Option<u8>,
+  pub serial_number: Option<String>,
+}
+
+impl UsbDeviceFilter {
+  /// https://wicg.github.io/webusb/#dfn-match-a-device-filter
+  pub fn matches(&self, device: &UsbDevice) -> bool {
+    if let Some(vendor_id) = self.vendor_id {
+      if device.vendor_id != vendor_id {
+        return false;
+      }
+    }
+    if let Some(product_id) = self.product_id {
+      if device.product_id != product_id {
+        return false;
+      }
+    }
+    if let Some(serial_number) = &self.serial_number {
+      if device.serial_number.as_ref() != Some(serial_number) {
+        return false;
+      }
+    }
+    match (self.class_code, self.subclass_code, self.protocol_code) {
+      (None, None, None) => true,
+      _ => {
+        // The device descriptor class triple matches, or any interface's
+        // class triple matches.
+        self.matches_class_triple(
+          device.device_class,
+          device.device_subclass,
+          device.device_protocol,
+        ) || device.configurations.iter().any(|config| {
+          config.interfaces.iter().any(|itf| {
+            itf.alternates.iter().any(|alt| {
+              self.matches_class_triple(
+                alt.interface_class,
+                alt.interface_subclass,
+                alt.interface_protocol,
+              )
+            })
+          })
+        })
+      }
+    }
+  }
+
+  fn matches_class_triple(
+    &self,
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+  ) -> bool {
+    match self.class_code {
+      Some(c) if c != class => return false,
+      None => return true,
+      _ => {}
+    }
+    match self.subclass_code {
+      Some(s) if s != subclass => return false,
+      None => return true,
+      _ => {}
+    }
+    !matches!(self.protocol_code, Some(p) if p != protocol)
+  }
+}
+
+/// Snapshot of everything a backend knows about a device before it is opened.
+pub(crate) struct DeviceData {
+  pub configurations: Vec<UsbConfiguration>,
+  pub active_configuration_value: Option<u8>,
+  pub device_class: u8,
+  pub device_subclass: u8,
+  pub device_protocol: u8,
+  pub device_version_major: u8,
+  pub device_version_minor: u8,
+  pub device_version_subminor: u8,
+  pub manufacturer_name: Option<String>,
+  pub product_id: u16,
+  pub product_name: Option<String>,
+  pub serial_number: Option<String>,
+  pub usb_version_major: u8,
+  pub usb_version_minor: u8,
+  pub usb_version_subminor: u8,
+  pub vendor_id: u16,
+  pub url: Option<String>,
+}
+
+/// Represents a UsbDevice.
+/// Obtain one through [`Usb::devices`], [`Usb::request_device`] or a
+/// [`UsbConnectionEvent::Connect`] event.
+/// https://wicg.github.io/webusb/#device-usage
+#[derive(Debug)]
+#[cfg_attr(
+  feature = "serde",
+  derive(Serialize),
+  serde(rename_all = "camelCase")
+)]
 pub struct UsbDevice {
+  /// Process-unique identifier for this device, stable while the device
+  /// remains connected. Referenced by [`UsbConnectionEvent::Disconnect`].
+  pub id: u64,
   /// List of configurations supported by the device.
   /// Populated from the configuration descriptor.
   /// `configurations.len()` SHALL be equal to the
@@ -328,170 +473,158 @@ pub struct UsbDevice {
   pub vendor_id: u16,
   /// If true, the underlying device handle is owned by this object.
   pub opened: bool,
-
   /// WEBUSB_URL value of the WebUSB Platform Capability Descriptor.
-  #[cfg_attr(
-    feature = "serde_derive",
-    doc = "NOTE: Skipped during serde deserialization.",
-    serde(skip)
-  )]
   pub url: Option<String>,
 
-  #[cfg(feature = "deno_ffi")]
-  /// Resource ID associated with this Device instance.
-  pub rid: i32,
-
-  #[cfg_attr(feature = "serde_derive", serde(skip))]
-  #[cfg(feature = "libusb")]
-  #[cfg(not(feature = "deno_ffi"))]
-  device: rusb::Device<rusb::Context>,
-
-  #[cfg_attr(feature = "serde_derive", serde(skip))]
-  #[cfg(feature = "libusb")]
-  #[cfg(not(feature = "deno_ffi"))]
-  device_handle: Option<rusb::DeviceHandle<rusb::Context>>,
+  #[cfg_attr(feature = "serde", serde(skip))]
+  backend: BackendDevice,
 }
 
 impl UsbDevice {
+  pub(crate) fn from_parts(
+    id: u64,
+    data: DeviceData,
+    backend: BackendDevice,
+  ) -> Self {
+    let configuration = data.active_configuration_value.and_then(|value| {
+      data
+        .configurations
+        .iter()
+        .find(|c| c.configuration_value == value)
+        .cloned()
+    });
+    UsbDevice {
+      id,
+      configurations: data.configurations,
+      configuration,
+      device_class: data.device_class,
+      device_subclass: data.device_subclass,
+      device_protocol: data.device_protocol,
+      device_version_major: data.device_version_major,
+      device_version_minor: data.device_version_minor,
+      device_version_subminor: data.device_version_subminor,
+      manufacturer_name: data.manufacturer_name,
+      product_id: data.product_id,
+      product_name: data.product_name,
+      serial_number: data.serial_number,
+      usb_version_major: data.usb_version_major,
+      usb_version_minor: data.usb_version_minor,
+      usb_version_subminor: data.usb_version_subminor,
+      vendor_id: data.vendor_id,
+      opened: false,
+      url: data.url,
+      backend,
+    }
+  }
+
   // https://wicg.github.io/webusb/#check-the-validity-of-the-control-transfer-parameters
   fn validate_control_setup(
-    &mut self,
+    &self,
     setup: &UsbControlTransferParameters,
   ) -> Result<()> {
-    // 3.
-    if let Some(configuration) = &self.configuration {
-      match setup.recipient {
-        // 4.
-        UsbRecipient::Interface => {
-          // 4.1
-          let interface_number: u8 = (setup.index & 0xFF) as u8;
+    match setup.recipient {
+      // 4.
+      UsbRecipient::Interface => {
+        // 4.1
+        let interface_number: u8 = (setup.index & 0xFF) as u8;
 
-          // 4.2
-          let interface = configuration
-            .interfaces
-            .iter()
-            .find(|itf| itf.interface_number == interface_number)
-            .ok_or(Error::NotFound)?;
+        // 4.2
+        let configuration =
+          self.configuration.as_ref().ok_or(Error::NotFound)?;
+        let interface = configuration
+          .interfaces
+          .iter()
+          .find(|itf| itf.interface_number == interface_number)
+          .ok_or(Error::NotFound)?;
 
-          // 4.3
-          if !interface.claimed {
-            return Err(Error::InvalidState);
-          }
+        // 4.3
+        if !interface.claimed {
+          return Err(Error::InvalidState);
         }
-        // 5.
-        UsbRecipient::Endpoint => {
-          // 5.1
-          let endpoint_number = setup.index as u8 & (1 << 4);
-
-          // 5.2
-          let direction = match (setup.index >> 8) & 1 {
-            1 => Direction::In,
-            _ => Direction::Out,
-          };
-
-          // 5.3-5.4
-          let interface = configuration
-            .interfaces
-            .iter()
-            .find(|itf| {
-              itf
-                .alternates
-                .iter()
-                .find(|alt| {
-                  alt
-                    .endpoints
-                    .iter()
-                    .find(|endpoint| {
-                      endpoint.endpoint_number == endpoint_number
-                        && endpoint.direction == direction
-                    })
-                    .is_some()
-                })
-                .is_some()
-            })
-            .ok_or(Error::NotFound)?;
-        }
-        _ => {}
       }
+      // 5.
+      UsbRecipient::Endpoint => {
+        // 5.1
+        let endpoint_number = (setup.index & 0x0F) as u8;
+
+        // 5.2
+        let direction = match setup.index & 0x80 {
+          0 => Direction::Out,
+          _ => Direction::In,
+        };
+
+        // 5.3-5.4
+        let configuration =
+          self.configuration.as_ref().ok_or(Error::NotFound)?;
+        configuration
+          .interfaces
+          .iter()
+          .find(|itf| {
+            itf.alternate.endpoints.iter().any(|endpoint| {
+              endpoint.endpoint_number == endpoint_number
+                && endpoint.direction == direction
+            })
+          })
+          .ok_or(Error::NotFound)?;
+      }
+      _ => {}
     }
 
     Ok(())
   }
-}
 
-impl UsbDevice {
-  pub fn isochronous_transfer_in(&mut self) {
-    unimplemented!()
+  /// Find the endpoint and its owning interface among the currently selected
+  /// alternate settings of the active configuration.
+  fn find_endpoint(
+    &self,
+    endpoint_number: u8,
+    direction: Direction,
+  ) -> Result<(&UsbInterface, &UsbEndpoint)> {
+    let configuration = self.configuration.as_ref().ok_or(Error::NotFound)?;
+    configuration
+      .interfaces
+      .iter()
+      .find_map(|itf| {
+        itf
+          .alternate
+          .endpoints
+          .iter()
+          .find(|endpoint| {
+            endpoint.endpoint_number == endpoint_number
+              && endpoint.direction == direction
+          })
+          .map(|endpoint| (itf, endpoint))
+      })
+      .ok_or(Error::NotFound)
   }
 
-  pub fn isochronous_transfer_out(&mut self) {
-    unimplemented!()
-  }
-
-  pub fn open(&mut self) -> Result<()> {
+  /// https://wicg.github.io/webusb/#dom-usbdevice-open
+  pub async fn open(&mut self) -> Result<()> {
     // 3. device is already open?
     if self.opened {
       return Ok(());
     }
 
     // 4.
-    #[cfg(feature = "libusb")]
-    {
-      #[cfg(feature = "deno_ffi")]
-      {
-        // TODO: ugly but works
-        let mut handle = ffi::RESOURCES
-          .lock()
-          .unwrap()
-          .get_mut(&self.rid)
-          .unwrap()
-          .lock()
-          .unwrap()
-          .device
-          .open()?;
-        ffi::RESOURCES
-          .lock()
-          .unwrap()
-          .get_mut(&self.rid)
-          .unwrap()
-          .lock()
-          .unwrap()
-          .device_handle
-          .replace(handle);
-      }
-
-      #[cfg(not(feature = "deno_ffi"))]
-      {
-        let handle = self.device.open()?;
-        self.device_handle = Some(handle);
-      }
-    }
+    self.backend.open().await?;
 
     // 5.
     self.opened = true;
     Ok(())
   }
 
-  pub fn close(&mut self) -> Result<()> {
+  /// https://wicg.github.io/webusb/#dom-usbdevice-close
+  pub async fn close(&mut self) -> Result<()> {
     // 3. device is already closed?
     if !self.opened {
       return Ok(());
     }
 
-    #[cfg(feature = "libusb")]
-    {
-      match get_device_handle!(self) {
-        Some(handle_ref) => {
-          // 5-6.
-          // release claimed interfaces, close device and release handle
-          drop(handle_ref);
-        }
-        None => unreachable!(),
-      };
-
-      #[cfg(not(feature = "deno_ffi"))]
-      {
-        self.device_handle = None;
+    // 5-6. release claimed interfaces, close device and release handle
+    self.backend.close().await?;
+    if let Some(configuration) = &mut self.configuration {
+      for interface in &mut configuration.interfaces {
+        interface.claimed = false;
       }
     }
 
@@ -500,1062 +633,508 @@ impl UsbDevice {
     Ok(())
   }
 
+  /// https://wicg.github.io/webusb/#dom-usbdevice-selectconfiguration
   /// `configuration_value` is the bConfigurationValue of the device configuration.
-  pub fn select_configuration(
+  pub async fn select_configuration(
     &mut self,
     configuration_value: u8,
   ) -> Result<()> {
-    #[cfg(feature = "libusb")]
-    {
-      // 3.
-      let configuration = match self
-        .configurations
-        .iter()
-        .position(|c| c.configuration_value == configuration_value)
-      {
-        Some(config_idx) => {
-          #[cfg(not(feature = "deno_ffi"))]
-          {
-            self.device.config_descriptor(config_idx as u8)?
-          }
+    // 3.
+    let configuration = self
+      .configurations
+      .iter()
+      .find(|c| c.configuration_value == configuration_value)
+      .cloned()
+      .ok_or(Error::NotFound)?;
 
-          #[cfg(feature = "deno_ffi")]
-          ffi::RESOURCES
-            .lock()
-            .unwrap()
-            .get_mut(&self.rid)
-            .unwrap()
-            .lock()
-            .unwrap()
-            .device
-            .config_descriptor(config_idx as u8)?
-        }
-        None => return Err(Error::NotFound),
-      };
-
-      // 4.
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
-
-      // 5-6.
-      let handle = match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          // Calls `libusb_set_configuration`
-          handle_ref.set_active_configuration(configuration_value)?;
-          handle_ref
-        }
-        None => unreachable!(),
-      };
-
-      // 7.
-      self.configuration = Some(UsbConfiguration::from(
-        configuration,
-        &get_device_handle!(self).unwrap(),
-      )?);
+    // 4.
+    if !self.opened {
+      return Err(Error::InvalidState);
     }
+
+    // 5-6.
+    self
+      .backend
+      .select_configuration(configuration_value)
+      .await?;
+
+    // 7.
+    self.configuration = Some(configuration);
     Ok(())
   }
 
-  pub fn claim_interface(&mut self, interface_number: u8) -> Result<()> {
+  /// https://wicg.github.io/webusb/#dom-usbdevice-claiminterface
+  pub async fn claim_interface(&mut self, interface_number: u8) -> Result<()> {
+    // 2.
+    let active_configuration =
+      self.configuration.as_mut().ok_or(Error::NotFound)?;
+    let interface = active_configuration
+      .interfaces
+      .iter_mut()
+      .find(|i| i.interface_number == interface_number)
+      .ok_or(Error::NotFound)?;
 
-    #[cfg(feature = "libusb")]
-    {
-      // 2.
-      let active_configuration =
-        self.configuration.as_mut().ok_or(Error::NotFound)?;
-      let mut interface = match active_configuration
+    // 3.
+    if !self.opened {
+      return Err(Error::InvalidState);
+    }
+
+    // 4.
+    if interface.claimed {
+      return Ok(());
+    }
+
+    // 5-6.
+    self.backend.claim_interface(interface_number).await?;
+    // Re-borrow: the backend call required releasing the earlier borrow.
+    if let Some(configuration) = &mut self.configuration {
+      if let Some(interface) = configuration
         .interfaces
         .iter_mut()
         .find(|i| i.interface_number == interface_number)
       {
-        Some(i) => i,
-        None => return Err(Error::NotFound),
-      };
-      // 3.
-      if !self.opened {
-        return Err(Error::InvalidState);
+        interface.claimed = true;
       }
-
-      // 4.
-      if interface.claimed {
-        return Ok(());
-      }
-      // 6.
-      interface.claimed = true;
-
-      // 5.
-      match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          handle_ref.claim_interface(interface_number)?;
-        }
-        None => unreachable!(),
-      };
     }
 
     Ok(())
   }
 
-  pub fn release_interface(&mut self, interface_number: u8) -> Result<()> {
-    #[cfg(feature = "libusb")]
-    {
-      // 3.
-      let active_configuration =
-        self.configuration.as_mut().ok_or(Error::NotFound)?;
-      let mut interface = match active_configuration
+  /// https://wicg.github.io/webusb/#dom-usbdevice-releaseinterface
+  pub async fn release_interface(
+    &mut self,
+    interface_number: u8,
+  ) -> Result<()> {
+    // 3.
+    let active_configuration =
+      self.configuration.as_mut().ok_or(Error::NotFound)?;
+    let interface = active_configuration
+      .interfaces
+      .iter_mut()
+      .find(|i| i.interface_number == interface_number)
+      .ok_or(Error::NotFound)?;
+
+    // 4.
+    if !self.opened {
+      return Err(Error::InvalidState);
+    }
+
+    // 5.
+    if !interface.claimed {
+      return Ok(());
+    }
+
+    // 6-7.
+    self.backend.release_interface(interface_number).await?;
+    if let Some(configuration) = &mut self.configuration {
+      if let Some(interface) = configuration
         .interfaces
         .iter_mut()
         .find(|i| i.interface_number == interface_number)
       {
-        Some(i) => i,
-        None => return Err(Error::NotFound),
-      };
-
-      // 4.
-      if !self.opened {
-        return Err(Error::InvalidState);
+        interface.claimed = false;
       }
-
-      // 5.
-      if !interface.claimed {
-        return Ok(());
-      }
-
-      // 6.
-      interface.claimed = false;
-
-      // 5.
-      match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          handle_ref.release_interface(interface_number)?;
-        }
-        None => unreachable!(),
-      };
     }
 
     Ok(())
   }
 
-  pub fn select_alternate_interface(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-selectalternateinterface
+  pub async fn select_alternate_interface(
     &mut self,
     interface_number: u8,
     alternate_setting: u8,
   ) -> Result<()> {
-    #[cfg(feature = "libusb")]
-    {
-      // 3.
-      let active_configuration =
-        self.configuration.as_mut().ok_or(Error::NotFound)?;
-      let interface = match active_configuration
+    // 3.
+    let active_configuration =
+      self.configuration.as_ref().ok_or(Error::NotFound)?;
+    let interface = active_configuration
+      .interfaces
+      .iter()
+      .find(|i| i.interface_number == interface_number)
+      .ok_or(Error::NotFound)?;
+
+    // 4.
+    if !self.opened || !interface.claimed {
+      return Err(Error::InvalidState);
+    }
+
+    // 5.
+    let alternate = interface
+      .alternates
+      .iter()
+      .find(|alt| alt.alternate_setting == alternate_setting)
+      .cloned()
+      .ok_or(Error::NotFound)?;
+
+    // 6.
+    self
+      .backend
+      .select_alternate_interface(interface_number, alternate_setting)
+      .await?;
+
+    // 7.
+    if let Some(configuration) = &mut self.configuration {
+      if let Some(interface) = configuration
         .interfaces
         .iter_mut()
         .find(|i| i.interface_number == interface_number)
       {
-        Some(i) => i,
-        None => return Err(Error::NotFound),
-      };
-
-      // 4.
-      if !self.opened || !interface.claimed {
-        return Err(Error::InvalidState);
+        interface.alternate = alternate;
       }
-
-      // 5-6.
-      match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          handle_ref
-            .set_alternate_setting(interface_number, alternate_setting)?;
-        }
-        None => unreachable!(),
-      };
     }
-    // 7.
-    return Ok(());
+    Ok(())
   }
 
-  pub fn control_transfer_in(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-controltransferin
+  pub async fn control_transfer_in(
     &mut self,
     setup: UsbControlTransferParameters,
-    length: usize,
-  ) -> Result<Vec<u8>> {
-    #[cfg(feature = "libusb")]
-    {
-      // 3.
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
+    length: u16,
+  ) -> Result<UsbInTransferResult> {
+    // 3.
+    if !self.opened {
+      return Err(Error::InvalidState);
+    }
 
-      // 4.
-      self.validate_control_setup(&setup)?;
+    // 4.
+    self.validate_control_setup(&setup)?;
 
-      // 5.
-      let mut buffer = vec![0u8; length];
-
-      // 6-7.
-      let bytes_transferred = match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          let req = match setup.request_type {
-            UsbRequestType::Standard => rusb::RequestType::Standard,
-            UsbRequestType::Class => rusb::RequestType::Class,
-            UsbRequestType::Vendor => rusb::RequestType::Vendor,
-          };
-
-          let recipient = match setup.recipient {
-            UsbRecipient::Device => rusb::Recipient::Device,
-            UsbRecipient::Interface => rusb::Recipient::Interface,
-            UsbRecipient::Endpoint => rusb::Recipient::Endpoint,
-            UsbRecipient::Other => rusb::Recipient::Other,
-          };
-
-          let req_type =
-            rusb::request_type(rusb::Direction::In, req, recipient);
-
-          handle_ref.read_control(
-            req_type,
-            setup.request,
-            setup.value,
-            setup.index,
-            &mut buffer,
-            std::time::Duration::new(0, 0),
-          )?
-        }
-        None => unreachable!(),
-      };
-
-      // 8-9.
-      // Returns the buffer containing first bytes_transferred instead of returning
-      // a UsbInTransferResult.
-      let result = &buffer[0..bytes_transferred];
-
-      // 10-11. TODO: Will need to handle `read_control` Err
-
-      // 13.
-      Ok(result.to_vec())
+    // 5-13.
+    match self.backend.control_transfer_in(&setup, length).await? {
+      TransferOutcome::Ok(data) => Ok(UsbInTransferResult {
+        data,
+        status: UsbTransferStatus::Ok,
+      }),
+      TransferOutcome::Stall => Ok(UsbInTransferResult {
+        data: Vec::new(),
+        status: UsbTransferStatus::Stall,
+      }),
+      TransferOutcome::Babble => Ok(UsbInTransferResult {
+        data: Vec::new(),
+        status: UsbTransferStatus::Babble,
+      }),
     }
   }
 
-  pub fn control_transfer_out(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-controltransferout
+  pub async fn control_transfer_out(
     &mut self,
     setup: UsbControlTransferParameters,
     data: &[u8],
-  ) -> Result<usize> {
-    #[cfg(feature = "libusb")]
-    {
-      // 2.
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
+  ) -> Result<UsbOutTransferResult> {
+    // 2.
+    if !self.opened {
+      return Err(Error::InvalidState);
+    }
 
-      // 3.
-      self.validate_control_setup(&setup)?;
+    // 3.
+    self.validate_control_setup(&setup)?;
 
-      // 4-8.
-      let bytes_written = match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          let req = match setup.request_type {
-            UsbRequestType::Standard => rusb::RequestType::Standard,
-            UsbRequestType::Class => rusb::RequestType::Class,
-            UsbRequestType::Vendor => rusb::RequestType::Vendor,
-          };
-
-          let recipient = match setup.recipient {
-            UsbRecipient::Device => rusb::Recipient::Device,
-            UsbRecipient::Interface => rusb::Recipient::Interface,
-            UsbRecipient::Endpoint => rusb::Recipient::Endpoint,
-            UsbRecipient::Other => rusb::Recipient::Other,
-          };
-
-          let req_type =
-            rusb::request_type(rusb::Direction::Out, req, recipient);
-
-          handle_ref.write_control(
-            req_type,
-            setup.request,
-            setup.value,
-            setup.index,
-            data,
-            std::time::Duration::new(0, 0),
-          )?
-        }
-        None => unreachable!(),
-      };
-
-      // 9.
-      Ok(bytes_written)
+    // 4-9.
+    match self.backend.control_transfer_out(&setup, data).await? {
+      TransferOutcome::Ok(bytes_written) => Ok(UsbOutTransferResult {
+        bytes_written,
+        status: UsbTransferStatus::Ok,
+      }),
+      TransferOutcome::Stall => Ok(UsbOutTransferResult {
+        bytes_written: 0,
+        status: UsbTransferStatus::Stall,
+      }),
+      TransferOutcome::Babble => Ok(UsbOutTransferResult {
+        bytes_written: 0,
+        status: UsbTransferStatus::Babble,
+      }),
     }
   }
 
-  pub fn clear_halt(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-clearhalt
+  pub async fn clear_halt(
     &mut self,
     direction: Direction,
     endpoint_number: u8,
   ) -> Result<()> {
-    #[cfg(feature = "libusb")]
-    {
-      let active_configuration =
-        self.configuration.as_ref().ok_or(Error::NotFound)?;
+    // 2.
+    let (interface, endpoint) =
+      self.find_endpoint(endpoint_number, direction)?;
+    let interface_number = interface.interface_number;
+    let endpoint_type = endpoint.r#type;
 
-      // 2.
-      let interface = active_configuration
-        .interfaces
-        .iter()
-        .find(|itf| {
-          itf
-            .alternates
-            .iter()
-            .find(|alt| {
-              alt
-                .endpoints
-                .iter()
-                .find(|endpoint| {
-                  endpoint.endpoint_number == endpoint_number
-                    && endpoint.direction == direction
-                })
-                .is_some()
-            })
-            .is_some()
-        })
-        .ok_or(Error::NotFound)?;
-
-      // 3.
-      if !self.opened || !interface.claimed {
-        return Err(Error::InvalidState);
-      }
-
-      // 4-5.
-      match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          let mut endpoint = endpoint_number;
-
-          match direction {
-            Direction::In => endpoint |= EP_DIR_IN,
-            Direction::Out => endpoint |= EP_DIR_OUT,
-          };
-
-          handle_ref.clear_halt(endpoint)?
-        }
-        None => unreachable!(),
-      };
+    // 3.
+    if !self.opened || !interface.claimed {
+      return Err(Error::InvalidState);
     }
-    Ok(())
+
+    // 4-5.
+    self
+      .backend
+      .clear_halt(interface_number, endpoint_type, direction, endpoint_number)
+      .await
   }
 
-  pub fn transfer_in(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-transferin
+  pub async fn transfer_in(
     &mut self,
     endpoint_number: u8,
     length: usize,
-  ) -> Result<Vec<u8>> {
-    #[cfg(feature = "libusb")]
+  ) -> Result<UsbInTransferResult> {
+    // 3.
+    let (interface, endpoint) =
+      self.find_endpoint(endpoint_number, Direction::In)?;
+    let interface_number = interface.interface_number;
+    let endpoint_type = endpoint.r#type;
+    let claimed = interface.claimed;
+
+    // 4.
+    match endpoint_type {
+      UsbEndpointType::Bulk | UsbEndpointType::Interrupt => {}
+      _ => return Err(Error::InvalidAccess),
+    }
+
+    // 5.
+    if !self.opened || !claimed {
+      return Err(Error::InvalidState);
+    }
+
+    // 6-15.
+    match self
+      .backend
+      .transfer_in(interface_number, endpoint_type, endpoint_number, length)
+      .await?
     {
-      // 3.
-      let endpoint = self
-        .configuration
-        .as_ref()
-        .ok_or(Error::NotFound)?
-        .interfaces
-        .iter()
-        .find_map(|itf| {
-          itf.alternates.iter().find_map(|alt| {
-            alt.endpoints.iter().find(|endpoint| {
-              endpoint.endpoint_number == endpoint_number
-                && endpoint.direction == Direction::In
-            })
-          })
-        })
-        .ok_or(Error::NotFound)?;
-
-      // 4.
-      match endpoint.r#type {
-        UsbEndpointType::Bulk | UsbEndpointType::Interrupt => {}
-        _ => return Err(Error::InvalidAccess),
-      }
-
-      // 5.
-      // FIXME: Check if interface is claimed
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
-
-      // 6.
-      let mut buffer = vec![0u8; length];
-
-      // 7-8.
-      let ty = endpoint.r#type;
-      let bytes_transferred = match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          let endpoint_addr = EP_DIR_IN | endpoint_number;
-
-          match ty {
-            UsbEndpointType::Bulk => handle_ref.read_bulk(
-              endpoint_addr,
-              &mut buffer,
-              std::time::Duration::new(0, 0),
-            )?,
-            UsbEndpointType::Interrupt => handle_ref.read_interrupt(
-              endpoint_addr,
-              &mut buffer,
-              std::time::Duration::new(0, 0),
-            )?,
-            _ => unreachable!(),
-          }
-        }
-        None => unreachable!(),
-      };
-
-      // 10.
-      let result = &buffer[0..bytes_transferred];
-
-      // 11-14. See `control_transfer_in` TODO comment
-
-      // 15.
-      Ok(result.to_vec())
+      TransferOutcome::Ok(data) => Ok(UsbInTransferResult {
+        data,
+        status: UsbTransferStatus::Ok,
+      }),
+      TransferOutcome::Stall => Ok(UsbInTransferResult {
+        data: Vec::new(),
+        status: UsbTransferStatus::Stall,
+      }),
+      TransferOutcome::Babble => Ok(UsbInTransferResult {
+        data: Vec::new(),
+        status: UsbTransferStatus::Babble,
+      }),
     }
   }
 
-  pub fn transfer_out(
+  /// https://wicg.github.io/webusb/#dom-usbdevice-transferout
+  pub async fn transfer_out(
     &mut self,
     endpoint_number: u8,
     data: &[u8],
-  ) -> Result<usize> {
-    #[cfg(feature = "libusb")]
+  ) -> Result<UsbOutTransferResult> {
+    // 2.
+    let (interface, endpoint) =
+      self.find_endpoint(endpoint_number, Direction::Out)?;
+    let interface_number = interface.interface_number;
+    let endpoint_type = endpoint.r#type;
+    let claimed = interface.claimed;
+
+    // 3.
+    match endpoint_type {
+      UsbEndpointType::Bulk | UsbEndpointType::Interrupt => {}
+      _ => return Err(Error::InvalidAccess),
+    }
+
+    // 4.
+    if !self.opened || !claimed {
+      return Err(Error::InvalidState);
+    }
+
+    // 5-9.
+    match self
+      .backend
+      .transfer_out(interface_number, endpoint_type, endpoint_number, data)
+      .await?
     {
-      // 2.
-      let endpoint = self
-        .configuration
-        .as_ref()
-        .ok_or(Error::NotFound)?
-        .interfaces
-        .iter()
-        .find_map(|itf| {
-          itf.alternates.iter().find_map(|alt| {
-            alt.endpoints.iter().find(|endpoint| {
-              endpoint.endpoint_number == endpoint_number
-                && endpoint.direction == Direction::Out
-            })
-          })
-        })
-        .ok_or(Error::NotFound)?;
-
-      // 3.
-      match endpoint.r#type {
-        UsbEndpointType::Bulk | UsbEndpointType::Interrupt => {}
-        _ => return Err(Error::InvalidAccess),
-      }
-
-      // 4.
-      // FIXME: Check if interface is claimed
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
-
-      // 5.
-      let ty = endpoint.r#type;
-      let bytes_written = match get_device_handle!(self) {
-        Some(ref mut handle_ref) => {
-          let endpoint_addr = EP_DIR_OUT | endpoint_number;
-
-          match ty {
-            UsbEndpointType::Bulk => handle_ref.write_bulk(
-              endpoint_addr,
-              data,
-              std::time::Duration::new(0, 0),
-            )?,
-            UsbEndpointType::Interrupt => handle_ref.write_interrupt(
-              endpoint_addr,
-              data,
-              std::time::Duration::new(0, 0),
-            )?,
-            _ => unreachable!(),
-          }
-        }
-        None => unreachable!(),
-      };
-
-      Ok(bytes_written)
+      TransferOutcome::Ok(bytes_written) => Ok(UsbOutTransferResult {
+        bytes_written,
+        status: UsbTransferStatus::Ok,
+      }),
+      TransferOutcome::Stall => Ok(UsbOutTransferResult {
+        bytes_written: 0,
+        status: UsbTransferStatus::Stall,
+      }),
+      TransferOutcome::Babble => Ok(UsbOutTransferResult {
+        bytes_written: 0,
+        status: UsbTransferStatus::Babble,
+      }),
     }
   }
 
-  pub fn reset(&mut self) -> Result<()> {
-    #[cfg(feature = "libusb")]
-    {
-      // 3.
-      if !self.opened {
-        return Err(Error::InvalidState);
-      }
+  /// https://wicg.github.io/webusb/#dom-usbdevice-isochronoustransferin
+  ///
+  /// Parameters are validated per the specification, but the transfer itself
+  /// is currently unsupported (`nusb` does not implement isochronous
+  /// transfers yet) and returns [`Error::NotSupported`].
+  pub async fn isochronous_transfer_in(
+    &mut self,
+    endpoint_number: u8,
+    packet_lengths: &[u32],
+  ) -> Result<UsbIsochronousInTransferResult> {
+    let (interface, endpoint) =
+      self.find_endpoint(endpoint_number, Direction::In)?;
+    let claimed = interface.claimed;
 
-      // 4-6.
-      match get_device_handle!(self) {
-        Some(ref mut handle_ref) => handle_ref.reset()?,
-        None => unreachable!(),
-      };
-    }
-    Ok(())
-  }
-}
-
-#[derive(Clone)]
-#[cfg_attr(
-  feature = "serde_derive",
-  derive(Serialize, Deserialize),
-  serde(rename_all = "lowercase")
-)]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "lowercase"))]
-pub enum UsbRequestType {
-  Standard,
-  Class,
-  Vendor,
-}
-
-#[derive(Clone, PartialEq)]
-#[cfg_attr(
-  feature = "serde_derive",
-  derive(Serialize, Deserialize),
-  serde(rename_all = "lowercase")
-)]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "lowercase"))]
-pub enum UsbRecipient {
-  Device,
-  Interface,
-  Endpoint,
-  Other,
-}
-
-#[derive(Clone)]
-#[cfg_attr(
-  feature = "serde_derive",
-  derive(Serialize, Deserialize),
-  serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "deno_ffi", deno_bindgen, serde(rename_all = "camelCase"))]
-pub struct UsbControlTransferParameters {
-  pub request_type: UsbRequestType,
-  pub recipient: UsbRecipient,
-  pub request: u8,
-  pub value: u16,
-  pub index: u16,
-}
-
-#[cfg(feature = "libusb")]
-impl TryFrom<rusb::Device<rusb::Context>> for UsbDevice {
-  type Error = Error;
-
-  fn try_from(device: rusb::Device<rusb::Context>) -> Result<UsbDevice> {
-    let device_descriptor = device.device_descriptor()?;
-    let device_class = device_descriptor.class_code();
-    let usb_version = device_descriptor.usb_version();
-
-    let config_descriptor = device.active_config_descriptor();
-    let handle = device.open()?;
-    let read_bos_descriptors = usb_version.0 >= 2 && usb_version.1 >= 1;
-    let url = if read_bos_descriptors {
-      // Check descriptor.iManufacturer != 0 && descriptor.iProduct != 0 && descriptor.iSerialNumber != 0
-
-      // Read capability descriptor
-      let request_type = rusb::request_type(
-        rusb::Direction::In,
-        rusb::RequestType::Standard,
-        rusb::Recipient::Device,
-      );
-      let kGetDescriptorRequest = 0x06;
-
-      let mut buffer = [0; 5];
-      let length = handle.read_control(
-        request_type,
-        kGetDescriptorRequest,
-        BOS_DESCRIPTOR_TYPE << 8,
-        0,
-        &mut buffer,
-        core::time::Duration::new(2, 0),
-      )?;
-      assert_eq!(length, 5);
-
-      // Read BOS descriptor
-      let new_length = buffer[2] | (buffer[3].wrapping_shl(8));
-      let mut new_buffer = vec![0; new_length as usize];
-      let request_type = rusb::request_type(
-        rusb::Direction::In,
-        rusb::RequestType::Standard,
-        rusb::Recipient::Device,
-      );
-      handle.read_control(
-        request_type,
-        kGetDescriptorRequest,
-        BOS_DESCRIPTOR_TYPE << 8,
-        0,
-        &mut new_buffer,
-        core::time::Duration::new(2, 0),
-      )?;
-
-      // Parse capibility from BOS descriptor
-      if let Some((vendor_code, landing_page_id)) = parse_bos(&new_buffer) {
-        let mut buffer = [0; 255];
-        let request_type = rusb::request_type(
-          rusb::Direction::In,
-          rusb::RequestType::Vendor,
-          rusb::Recipient::Device,
-        );
-
-        handle.read_control(
-          request_type,
-          vendor_code,
-          landing_page_id as u16,
-          GET_URL_REQUEST,
-          &mut buffer,
-          core::time::Duration::new(2, 0),
-        )?;
-
-        // Parse URL descriptor
-        let url = parse_webusb_url(&buffer);
-        url
-      } else {
-        None
-      }
-    } else {
-      None
-    };
-
-    let configuration = match config_descriptor {
-      Ok(config_descriptor) => {
-        UsbConfiguration::from(config_descriptor, &handle).ok()
-      }
-      Err(_) => None,
-    };
-
-    let num_configurations = device_descriptor.num_configurations();
-    let mut configurations: Vec<UsbConfiguration> = vec![];
-    for idx in 0..num_configurations {
-      if let Ok(curr_config_descriptor) = device.config_descriptor(idx) {
-        configurations
-          .push(UsbConfiguration::from(curr_config_descriptor, &handle)?);
-      }
+    if endpoint.r#type != UsbEndpointType::Isochronous {
+      return Err(Error::InvalidAccess);
     }
 
-    let device_version = device_descriptor.device_version();
-    let manufacturer_name = handle
-      .read_manufacturer_string_ascii(&device_descriptor)
-      .ok();
-    let product_name =
-      handle.read_product_string_ascii(&device_descriptor).ok();
-    let serial_number = handle
-      .read_serial_number_string_ascii(&device_descriptor)
-      .ok();
+    if !self.opened || !claimed {
+      return Err(Error::InvalidState);
+    }
 
-    #[cfg(feature = "deno_ffi")]
-    let rid = ffi::RESOURCES.lock().unwrap().len() as i32; // TODO
+    let _ = packet_lengths;
+    Err(Error::NotSupported)
+  }
 
-    let usb_device = UsbDevice {
-      configurations,
-      configuration,
-      device_class,
-      device_subclass: device_descriptor.sub_class_code(),
-      device_protocol: device_descriptor.protocol_code(),
-      device_version_major: device_version.major(),
-      device_version_minor: device_version.minor(),
-      device_version_subminor: device_version.sub_minor(),
-      product_id: device_descriptor.product_id(),
-      usb_version_major: usb_version.major(),
-      usb_version_minor: usb_version.minor(),
-      usb_version_subminor: usb_version.sub_minor(),
-      vendor_id: device_descriptor.vendor_id(),
-      manufacturer_name,
-      product_name,
-      serial_number,
-      opened: false,
-      url,
-      #[cfg(not(feature = "deno_ffi"))]
-      device,
-      #[cfg(not(feature = "deno_ffi"))]
-      device_handle: None,
-      #[cfg(feature = "deno_ffi")]
-      rid, // TODO
-    };
+  /// https://wicg.github.io/webusb/#dom-usbdevice-isochronoustransferout
+  ///
+  /// Parameters are validated per the specification, but the transfer itself
+  /// is currently unsupported (`nusb` does not implement isochronous
+  /// transfers yet) and returns [`Error::NotSupported`].
+  pub async fn isochronous_transfer_out(
+    &mut self,
+    endpoint_number: u8,
+    data: &[u8],
+    packet_lengths: &[u32],
+  ) -> Result<UsbIsochronousOutTransferResult> {
+    let (interface, endpoint) =
+      self.find_endpoint(endpoint_number, Direction::Out)?;
+    let claimed = interface.claimed;
 
-    #[cfg(feature = "deno_ffi")]
-    ffi::insert_device(rid, device);
+    if endpoint.r#type != UsbEndpointType::Isochronous {
+      return Err(Error::InvalidAccess);
+    }
 
-    // Explicitly close the device.
-    drop(handle);
+    if !self.opened || !claimed {
+      return Err(Error::InvalidState);
+    }
 
-    Ok(usb_device)
+    let _ = (data, packet_lengths);
+    Err(Error::NotSupported)
+  }
+
+  /// https://wicg.github.io/webusb/#dom-usbdevice-reset
+  pub async fn reset(&mut self) -> Result<()> {
+    // 3.
+    if !self.opened {
+      return Err(Error::InvalidState);
+    }
+
+    // 4-6.
+    self.backend.reset().await
   }
 }
 
-/// A WebUSB Context. Provides APIs for device enumaration.
-#[cfg(feature = "libusb")]
-pub struct Context(rusb::Context);
+/// A connect or disconnect event, yielded by [`UsbEvents`].
+/// https://wicg.github.io/webusb/#events
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum UsbConnectionEvent {
+  Connect(UsbDevice),
+  Disconnect {
+    /// The [`UsbDevice::id`] of the disconnected device.
+    id: u64,
+    vendor_id: u16,
+    product_id: u16,
+  },
+}
 
-#[cfg(feature = "libusb")]
-impl Context {
-  pub fn init() -> Result<Self> {
-    let ctx = rusb::Context::new()?;
-    Ok(Self(ctx))
+/// Stream of [`UsbConnectionEvent`]s. Obtained from [`Usb::events`].
+pub struct UsbEvents(pub(crate) UsbEventsInner);
+
+pub(crate) enum UsbEventsInner {
+  #[cfg(feature = "native")]
+  Native(backend::native::NativeEvents),
+  #[cfg(feature = "mock")]
+  Mock(async_channel::Receiver<UsbConnectionEvent>),
+}
+
+impl UsbEvents {
+  /// Wait for the next connect/disconnect event. Returns `None` if the
+  /// event source has been closed.
+  pub async fn next(&mut self) -> Option<UsbConnectionEvent> {
+    match &mut self.0 {
+      #[cfg(feature = "native")]
+      UsbEventsInner::Native(events) => events.next().await,
+      #[cfg(feature = "mock")]
+      UsbEventsInner::Mock(receiver) => receiver.recv().await.ok(),
+    }
   }
 
-  pub fn devices(&self) -> Result<Vec<UsbDevice>> {
-    let devices = self.0.devices()?;
+  /// Blocking variant of [`UsbEvents::next`].
+  pub fn next_blocking(&mut self) -> Option<UsbConnectionEvent> {
+    futures_lite::future::block_on(self.next())
+  }
+}
 
-    let usb_devices: Vec<UsbDevice> = devices
-      .iter()
-      .filter(|d| {
-        // Do not list hubs.
-        // TODO(@littledivy): WTF is this code
-        d.device_descriptor().is_ok()
-          && d.device_descriptor().unwrap().class_code() != 9
+/// The WebUSB entry point, equivalent of `navigator.usb`.
+/// https://wicg.github.io/webusb/#usb
+pub struct Usb(pub(crate) UsbInner);
+
+pub(crate) enum UsbInner {
+  #[cfg(feature = "native")]
+  Native,
+  #[cfg(feature = "mock")]
+  Mock(backend::mock::MockHubRef),
+}
+
+impl Usb {
+  /// A `Usb` backed by the operating system's real USB devices.
+  #[cfg(feature = "native")]
+  pub fn new() -> Result<Self> {
+    Ok(Usb(UsbInner::Native))
+  }
+
+  /// A `Usb` backed by an in-memory mock hub, along with a controller used
+  /// to plug and unplug mock devices.
+  #[cfg(feature = "mock")]
+  pub fn mock() -> (Self, MockController) {
+    let hub = backend::mock::MockHubRef::default();
+    (Usb(UsbInner::Mock(hub.clone())), MockController::new(hub))
+  }
+
+  /// https://wicg.github.io/webusb/#dom-usb-getdevices
+  pub async fn devices(&self) -> Result<Vec<UsbDevice>> {
+    match &self.0 {
+      #[cfg(feature = "native")]
+      UsbInner::Native => backend::native::enumerate().await,
+      #[cfg(feature = "mock")]
+      UsbInner::Mock(hub) => Ok(hub.enumerate()),
+    }
+  }
+
+  /// https://wicg.github.io/webusb/#dom-usb-requestdevice
+  ///
+  /// There is no permission chooser outside a browser: the first device
+  /// matching any of `filters` is returned. An empty filter list matches
+  /// every device.
+  pub async fn request_device(
+    &self,
+    filters: &[UsbDeviceFilter],
+  ) -> Result<UsbDevice> {
+    let devices = self.devices().await?;
+    devices
+      .into_iter()
+      .find(|device| {
+        filters.is_empty() || filters.iter().any(|f| f.matches(device))
       })
-      .map(|d| UsbDevice::try_from(d))
-      .filter(|d| {
-        d.is_ok()
-          || d.as_ref().err().unwrap() != &Error::Usb(rusb::Error::Access)
-      })
-      .map(|d| d.unwrap())
-      .collect::<Vec<UsbDevice>>();
-    Ok(usb_devices)
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  // These tests depends on real hardware.
-  // TODO(@littledivy): Document running tests locally.
-  use crate::Context;
-  use crate::Direction;
-  use crate::Error;
-  use crate::UsbControlTransferParameters;
-  use crate::UsbDevice;
-  use crate::UsbRecipient;
-  use crate::UsbRequestType;
-
-  use std::sync::Arc;
-  use std::sync::Mutex;
-  use std::thread;
-
-  // Arduino Leonardo (2341:8036).
-  // Make sure you follow the instructions and load this sketch https://github.com/webusb/arduino/blob/gh-pages/demos/console/sketch/sketch.ino
-  fn test_device() -> UsbDevice {
-    let ctx = Context::init().unwrap();
-    let devices = ctx.devices().unwrap();
-    let device = devices.into_iter().find(|d| d.vendor_id == 0x2341 && d.product_id == 0x8036).expect("Device not found.\nhelp: ensure you follow the test setup instructions carefully");
-    device
+      .ok_or(Error::NotFound)
   }
 
-  #[test]
-  fn test_bos() -> crate::Result<()> {
-    // Read and Parse BOS the descriptor.
-    let mut device = test_device();
-    assert_eq!(
-      device.url,
-      Some("https://webusb.github.io/arduino/demos/console".to_string())
-    );
-
-    Ok(())
-  }
-
-  #[test]
-  fn test_device_initial_state() -> crate::Result<()> {
-    let mut device = test_device();
-
-    device.open()?;
-    device.open()?;
-
-    device.close()?;
-    device.close()?;
-    Ok(())
-  }
-
-  #[test]
-  fn test_device_invalid_state() -> crate::Result<()> {
-    let mut device = test_device();
-
-    // Without open() should panic.
-    device.select_configuration(1).unwrap_err();
-    device.claim_interface(2).unwrap_err();
-
-    device.select_alternate_interface(2, 0).unwrap_err();
-
-    device
-      .control_transfer_out(
-        UsbControlTransferParameters {
-          request_type: crate::UsbRequestType::Class,
-          recipient: crate::UsbRecipient::Interface,
-          request: 0x22,
-          value: 0x01,
-          index: 2,
-        },
-        &[],
-      )
-      .unwrap_err();
-
-    device.transfer_out(4, b"H").unwrap_err();
-    device.clear_halt(Direction::Out, 4).unwrap_err();
-    device.transfer_out(4, b"L").unwrap_err();
-    device.clear_halt(Direction::Out, 4).unwrap_err();
-
-    device
-      .control_transfer_out(
-        UsbControlTransferParameters {
-          request_type: crate::UsbRequestType::Class,
-          recipient: crate::UsbRecipient::Interface,
-          request: 0x22,
-          value: 0x00,
-          index: 2,
-        },
-        &[],
-      )
-      .unwrap_err();
-    device.release_interface(2).unwrap_err();
-    device.reset().unwrap_err();
-    device.close()?;
-    Ok(())
-  }
-
-  #[flaky_test::flaky_test]
-  fn test_device_blink() {
-      fn test(device: &mut UsbDevice) {
-        device.transfer_out(4, b"H").unwrap();
-        device.clear_halt(Direction::Out, 4).unwrap();
-
-        device.transfer_out(4, b"L").unwrap();
-        device.clear_halt(Direction::Out, 4).unwrap();
-
-        let recv = device.transfer_in(5, 64).unwrap();
-        let mut first_run = false;
-
-        match recv.as_slice() {
-          b"Sketch begins.\r\n> " => {
-            first_run = true;
-          }
-          b"H\r\nTurning LED on.\r\n> " => {}
-          _ => unreachable!(),
-        };
-        let recv = device.transfer_in(5, 64).unwrap();
-
-        match (first_run, recv.as_slice()) {
-          (true, b"H\r\nTurning LED on.\r\n> ")
-          | (false, b"L\r\nTurning LED off.\r\n> ") => {}
-          _ => unreachable!(),
-        };
+  /// Subscribe to connect/disconnect events.
+  /// Equivalent of the `connect`/`disconnect` events on `navigator.usb`.
+  pub fn events(&self) -> Result<UsbEvents> {
+    match &self.0 {
+      #[cfg(feature = "native")]
+      UsbInner::Native => Ok(UsbEvents(UsbEventsInner::Native(
+        backend::native::NativeEvents::new()?,
+      ))),
+      #[cfg(feature = "mock")]
+      UsbInner::Mock(hub) => {
+        Ok(UsbEvents(UsbEventsInner::Mock(hub.subscribe())))
       }
-      let mut device = test_device();
-
-      device.open().unwrap();
-
-      // A real world application should use `device.configuration.is_none()`.
-      match device.select_configuration(1) {
-        Ok(_) => {} // Unreachable in the test runner
-        Err(crate::Error::Usb(rusb::Error::Busy))
-        | Err(crate::Error::InvalidState) => {}
-        _ => unreachable!(),
-      }
-
-      // Device might be busy.
-      if device.claim_interface(2).is_ok() {
-        device.select_alternate_interface(2, 0).unwrap();
-
-        device
-          .control_transfer_out(
-            UsbControlTransferParameters {
-              request_type: crate::UsbRequestType::Class,
-              recipient: crate::UsbRecipient::Interface,
-              request: 0x22,
-              value: 0x01,
-              index: 2,
-            },
-            &[],
-          )
-          .unwrap();
-        test(&mut device);
-        device
-          .control_transfer_out(
-            UsbControlTransferParameters {
-              request_type: crate::UsbRequestType::Class,
-              recipient: crate::UsbRecipient::Interface,
-              request: 0x22,
-              value: 0x00,
-              index: 2,
-            },
-            &[],
-          )
-          .unwrap();
-      } else {
-        test(&mut device);
-      }
-      device.release_interface(2).unwrap();
-      device.reset().unwrap();
-      device.close().unwrap();
-  }
-
-  #[test]
-  fn test_device_control() {
-      async fn test(device: &mut UsbDevice) {
-        let device_descriptor_bytes = device
-          .control_transfer_in(
-            UsbControlTransferParameters {
-              request_type: crate::UsbRequestType::Standard,
-              recipient: crate::UsbRecipient::Device,
-              // kGetDescriptorRequest
-              request: 0x06,
-              // kDeviceDescriptorType
-              value: 0x01 << 8,
-              index: 0,
-            },
-            // kDeviceDescriptorLength
-            18,
-          )
-          .unwrap();
-
-        assert_eq!(device_descriptor_bytes.len(), 18);
-        assert_eq!(device_descriptor_bytes[0], 18);
-
-        let bcd_usb = u16::from_le_bytes([
-          device_descriptor_bytes[2],
-          device_descriptor_bytes[3],
-        ]);
-
-        assert_eq!((bcd_usb >> 8) as u8, device.usb_version_major);
-        assert_eq!(((bcd_usb & 0xf0) >> 4) as u8, device.usb_version_minor);
-        assert_eq!((bcd_usb & 0xf) as u8, device.usb_version_subminor);
-
-        assert_eq!(device_descriptor_bytes[4], device.device_class);
-        assert_eq!(device_descriptor_bytes[5], device.device_subclass);
-        assert_eq!(device_descriptor_bytes[6], device.device_protocol);
-
-        let vendor_id = u16::from_le_bytes([
-          device_descriptor_bytes[8],
-          device_descriptor_bytes[9],
-        ]);
-
-        assert_eq!(vendor_id, device.vendor_id);
-
-        let product_id = u16::from_le_bytes([
-          device_descriptor_bytes[10],
-          device_descriptor_bytes[11],
-        ]);
-
-        assert_eq!(product_id, device.product_id);
-
-        let bcd_device = u16::from_le_bytes([
-          device_descriptor_bytes[12],
-          device_descriptor_bytes[13],
-        ]);
-
-        assert_eq!((bcd_device >> 8) as u8, device.device_version_major);
-        assert_eq!(
-          ((bcd_device & 0xf0) >> 4) as u8,
-          device.device_version_minor
-        );
-        assert_eq!((bcd_device & 0xf) as u8, device.device_version_subminor);
-
-        assert_eq!(
-          device_descriptor_bytes[17],
-          device.configurations.len() as u8
-        );
-      }
-      let mut device = test_device();
-
-      device.open().unwrap();
-
-      // A real world application should use `device.configuration.is_none()`.
-      match device.select_configuration(1) {
-        Ok(_) => {} // Unreachable in the test runner
-        Err(crate::Error::Usb(rusb::Error::Busy))
-        | Err(crate::Error::InvalidState) => {}
-        _ => unreachable!(),
-      }
-
-      // Device might be busy.
-      if device.claim_interface(2).is_ok() {
-        device.select_alternate_interface(2, 0).unwrap();
-
-        device
-          .control_transfer_out(
-            UsbControlTransferParameters {
-              request_type: crate::UsbRequestType::Class,
-              recipient: crate::UsbRecipient::Interface,
-              request: 0x22,
-              value: 0x01,
-              index: 2,
-            },
-            &[],
-          )
-          .unwrap();
-        test(&mut device);
-        device
-          .control_transfer_out(
-            UsbControlTransferParameters {
-              request_type: crate::UsbRequestType::Class,
-              recipient: crate::UsbRecipient::Interface,
-              request: 0x22,
-              value: 0x00,
-              index: 2,
-            },
-            &[],
-          )
-          .unwrap();
-      } else {
-        test(&mut device);
-      }
-      device.release_interface(2).unwrap();
-      device.reset().unwrap();
-      device.close().unwrap();
-  }
-
-  #[test]
-  #[should_panic]
-  // IMPORTANT! These are meant to fail when the methods are implemented.
-  fn test_unimplemented1() {
-    let mut device = test_device();
-    device.isochronous_transfer_in();
-  }
-
-  #[test]
-  #[should_panic]
-  // IMPORTANT! These are meant to fail when the methods are implemented.
-  fn test_unimplemented2() {
-    let mut device = test_device();
-    device.isochronous_transfer_out();
-  }
-
-  #[test]
-  fn test_device_not_found() -> crate::Result<()> {
-    let mut device = test_device();
-
-    device.open()?;
-
-    device.select_configuration(255).unwrap_err();
-    device.claim_interface(255).unwrap_err();
-    device.release_interface(255).unwrap_err();
-    device.select_alternate_interface(255, 0).unwrap_err();
-
-    device.close()?;
-    Ok(())
-  }
-
-  #[test]
-  fn test_validate_control_setup() {
-    let mut device = test_device();
-    device.open().unwrap();
-
-    fn standard_ctrl_req(device: &mut UsbDevice) -> crate::Result<()> {
-      device.validate_control_setup(&UsbControlTransferParameters {
-        request_type: UsbRequestType::Class,
-        recipient: UsbRecipient::Interface,
-        request: 0x22,
-        value: 0x01,
-        index: 2,
-      })
     }
-
-    // Interface is not claimed.
-    standard_ctrl_req(&mut device).unwrap_err();
-
-    // Interface is claimed and selected.
-    device.claim_interface(2).unwrap();
-    standard_ctrl_req(&mut device).unwrap();
-  }
-
-  #[test]
-  fn test_error_impl() {
-    let nope: Option<()> = None;
-    assert_eq!(Error::from(nope), Error::NotFound);
   }
 }
